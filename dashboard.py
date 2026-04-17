@@ -670,7 +670,6 @@ async function refreshData() {
 }
 
 loadData();
-setInterval(loadData, 30000);
 </script>
 </body>
 </html>
