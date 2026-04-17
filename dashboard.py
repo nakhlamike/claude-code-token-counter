@@ -75,6 +75,7 @@ def get_dashboard_data(db_path=DB_PATH):
             "project":       r["project_name"] or "unknown",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
             "last_date":     (r["last_timestamp"] or "")[:10],
+            "last_full":     (r["last_timestamp"] or "")[:16],
             "duration_min":  duration_min,
             "model":         r["model"] or "unknown",
             "turns":         r["turn_count"] or 0,
@@ -189,6 +190,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div class="filter-sep"></div>
   <div class="filter-label">Range</div>
   <div class="range-group">
+    <button class="range-btn" data-range="1h"  onclick="setRange('1h')">1h</button>
+    <button class="range-btn" data-range="1d"  onclick="setRange('1d')">1d</button>
     <button class="range-btn" data-range="7d"  onclick="setRange('7d')">7d</button>
     <button class="range-btn" data-range="30d" onclick="setRange('30d')">30d</button>
     <button class="range-btn" data-range="90d" onclick="setRange('90d')">90d</button>
@@ -315,20 +318,25 @@ const TOKEN_COLORS = {
 const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6','#34d399','#60a5fa'];
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { '1h': 'Last Hour', '1d': 'Today', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { '1h': 1, '1d': 1, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 
 function getRangeCutoff(range) {
   if (range === 'all') return null;
-  const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
+  if (range === '1h') {
+    const d = new Date();
+    d.setHours(d.getHours() - 1);
+    return d.toISOString().slice(0, 16); // "2026-04-17T13:30"
+  }
+  const days = range === '1d' ? 0 : range === '7d' ? 7 : range === '30d' ? 30 : 90;
   const d = new Date();
-  d.setDate(d.getDate() - days);
-  return d.toISOString().slice(0, 10);
+  if (days > 0) d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10); // "2026-04-17"
 }
 
 function readURLRange() {
   const p = new URLSearchParams(window.location.search).get('range');
-  return ['7d', '30d', '90d', 'all'].includes(p) ? p : '30d';
+  return ['1h', '1d', '7d', '30d', '90d', 'all'].includes(p) ? p : '30d';
 }
 
 function setRange(range) {
@@ -415,10 +423,11 @@ function applyFilter() {
   if (!rawData) return;
 
   const cutoff = getRangeCutoff(selectedRange);
+  const dayCutoff = cutoff ? cutoff.slice(0, 10) : null;
 
   // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) && (!dayCutoff || r.day >= dayCutoff)
   );
 
   // Daily chart: aggregate by day
@@ -445,10 +454,13 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
-  const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!cutoff || s.last_date >= cutoff)
-  );
+  // Filter sessions by model + date/datetime range
+  const filteredSessions = rawData.sessions_all.filter(s => {
+    if (!selectedModels.has(s.model)) return false;
+    if (!cutoff) return true;
+    if (selectedRange === '1h') return (s.last_full || '') >= cutoff;
+    return s.last_date >= dayCutoff;
+  });
 
   // Add session counts into modelMap
   for (const s of filteredSessions) {
