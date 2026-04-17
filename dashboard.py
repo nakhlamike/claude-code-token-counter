@@ -117,7 +117,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
   header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
-  header .meta { color: var(--muted); font-size: 12px; }
+  header .meta { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; }
+  .refresh-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer; transition: border-color 0.15s, color 0.15s; }
+  .refresh-btn:hover { border-color: var(--accent); color: var(--text); }
+  .refresh-btn.spinning { pointer-events: none; opacity: 0.5; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
@@ -175,7 +178,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 <header>
   <h1>Claude Code Usage Dashboard</h1>
-  <div class="meta" id="meta">Loading...</div>
+  <div class="meta" id="meta"><span id="meta-text">Loading...</span><button class="refresh-btn" onclick="refreshData()">Refresh</button></div>
 </header>
 
 <div id="filter-bar">
@@ -624,7 +627,7 @@ async function loadData() {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + d.error + '</div>';
       return;
     }
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + ' \u00b7 Auto-refresh in 30s';
+    document.getElementById('meta-text').textContent = 'Updated: ' + d.generated_at;
 
     const isFirstLoad = rawData === null;
     rawData = d;
@@ -643,6 +646,15 @@ async function loadData() {
   } catch(e) {
     console.error(e);
   }
+}
+
+async function refreshData() {
+  const btn = document.querySelector('.refresh-btn');
+  btn.classList.add('spinning');
+  btn.textContent = 'Refreshing...';
+  await loadData();
+  btn.classList.remove('spinning');
+  btn.textContent = 'Refresh';
 }
 
 loadData();
@@ -665,6 +677,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
         elif self.path == "/api/data":
+            try:
+                from scanner import scan
+                scan(verbose=False)
+            except Exception:
+                pass
             data = get_dashboard_data()
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
@@ -678,7 +695,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
+def _background_scanner(interval=60):
+    """Re-scan JSONL files periodically so the dashboard stays current."""
+    import time
+    from scanner import scan
+    while True:
+        time.sleep(interval)
+        try:
+            scan(verbose=False)
+        except Exception:
+            pass
+
+
 def serve(port=8080):
+    import threading
+    t = threading.Thread(target=_background_scanner, daemon=True)
+    t.start()
+
     server = HTTPServer(("localhost", port), DashboardHandler)
     print(f"Dashboard running at http://localhost:{port}")
     print("Press Ctrl+C to stop.")
