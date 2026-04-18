@@ -52,6 +52,32 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
+    # ── Hourly per-model, last 3 days (for 1h / 1d views) ───────────────────
+    hourly_rows = conn.execute("""
+        SELECT
+            substr(timestamp, 1, 13)   as hour,
+            COALESCE(model, 'unknown') as model,
+            SUM(input_tokens)          as input,
+            SUM(output_tokens)         as output,
+            SUM(cache_read_tokens)     as cache_read,
+            SUM(cache_creation_tokens) as cache_creation,
+            COUNT(*)                   as turns
+        FROM turns
+        WHERE timestamp >= datetime('now', '-3 days')
+        GROUP BY hour, model
+        ORDER BY hour, model
+    """).fetchall()
+
+    hourly_by_model = [{
+        "hour":           r["hour"],
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in hourly_rows]
+
     # ── All sessions (client filters by range and model) ──────────────────────
     session_rows = conn.execute("""
         SELECT
@@ -88,10 +114,11 @@ def get_dashboard_data(db_path=DB_PATH):
     conn.close()
 
     return {
-        "all_models":     all_models,
-        "daily_by_model": daily_by_model,
-        "sessions_all":   sessions_all,
-        "generated_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "all_models":      all_models,
+        "daily_by_model":  daily_by_model,
+        "hourly_by_model": hourly_by_model,
+        "sessions_all":    sessions_all,
+        "generated_at":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -318,20 +345,17 @@ const TOKEN_COLORS = {
 const MODEL_COLORS = ['#d97757','#4f8ef7','#4ade80','#a78bfa','#fbbf24','#f472b6','#34d399','#60a5fa'];
 
 // ── Time range ─────────────────────────────────────────────────────────────
-const RANGE_LABELS = { '1h': 'Last Hour', '1d': 'Today', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
-const RANGE_TICKS  = { '1h': 1, '1d': 1, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
+const RANGE_LABELS = { '1h': 'Last Hour', '1d': 'Last 24 Hours', '7d': 'Last 7 Days', '30d': 'Last 30 Days', '90d': 'Last 90 Days', 'all': 'All Time' };
+const RANGE_TICKS  = { '1h': 12, '1d': 24, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 
 function getRangeCutoff(range) {
   if (range === 'all') return null;
-  if (range === '1h') {
-    const d = new Date();
-    d.setHours(d.getHours() - 1);
-    return d.toISOString().slice(0, 16); // "2026-04-17T13:30"
-  }
-  const days = range === '1d' ? 0 : range === '7d' ? 7 : range === '30d' ? 30 : 90;
   const d = new Date();
-  if (days > 0) d.setDate(d.getDate() - days);
-  return d.toISOString().slice(0, 10); // "2026-04-17"
+  if (range === '1h') { d.setHours(d.getHours() - 1);   return d.toISOString().slice(0, 16); }
+  if (range === '1d') { d.setDate(d.getDate() - 1);      return d.toISOString().slice(0, 16); }
+  const days = range === '7d' ? 7 : range === '30d' ? 30 : 90;
+  d.setDate(d.getDate() - days);
+  return d.toISOString().slice(0, 10);
 }
 
 function readURLRange() {
@@ -422,54 +446,62 @@ function updateURL() {
 function applyFilter() {
   if (!rawData) return;
 
-  const cutoff = getRangeCutoff(selectedRange);
-  const dayCutoff = cutoff ? cutoff.slice(0, 10) : null;
+  const cutoff    = getRangeCutoff(selectedRange);
+  const isShort   = selectedRange === '1h' || selectedRange === '1d';
 
-  // Filter daily rows by model + date range
-  const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!dayCutoff || r.day >= dayCutoff)
-  );
-
-  // Daily chart: aggregate by day
-  const dailyMap = {};
-  for (const r of filteredDaily) {
-    if (!dailyMap[r.day]) dailyMap[r.day] = { day: r.day, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
-    const d = dailyMap[r.day];
-    d.input          += r.input;
-    d.output         += r.output;
-    d.cache_read     += r.cache_read;
-    d.cache_creation += r.cache_creation;
+  // ── Source rows: hourly for 1h/1d, daily otherwise ────────────────────────
+  let sourceRows, timeKey;
+  if (isShort) {
+    const hourCutoff = cutoff ? cutoff.slice(0, 13) : null;
+    sourceRows = rawData.hourly_by_model.filter(r =>
+      selectedModels.has(r.model) && (!hourCutoff || r.hour >= hourCutoff)
+    );
+    timeKey = 'hour';
+  } else {
+    const dayCutoff = cutoff ? cutoff.slice(0, 10) : null;
+    sourceRows = rawData.daily_by_model.filter(r =>
+      selectedModels.has(r.model) && (!dayCutoff || r.day >= dayCutoff)
+    );
+    timeKey = 'day';
   }
-  const daily = Object.values(dailyMap).sort((a, b) => a.day.localeCompare(b.day));
 
-  // By model: aggregate tokens + turns from daily data
+  // ── Time series for chart ──────────────────────────────────────────────────
+  const timeMap = {};
+  for (const r of sourceRows) {
+    const k = r[timeKey];
+    if (!timeMap[k]) timeMap[k] = { time: k, input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+    timeMap[k].input          += r.input;
+    timeMap[k].output         += r.output;
+    timeMap[k].cache_read     += r.cache_read;
+    timeMap[k].cache_creation += r.cache_creation;
+  }
+  const timeSeries = Object.values(timeMap).sort((a, b) => a.time.localeCompare(b.time));
+
+  // ── By model ───────────────────────────────────────────────────────────────
   const modelMap = {};
-  for (const r of filteredDaily) {
+  for (const r of sourceRows) {
     if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
     const m = modelMap[r.model];
-    m.input          += r.input;
-    m.output         += r.output;
-    m.cache_read     += r.cache_read;
-    m.cache_creation += r.cache_creation;
-    m.turns          += r.turns;
+    m.input += r.input; m.output += r.output;
+    m.cache_read += r.cache_read; m.cache_creation += r.cache_creation;
+    m.turns += r.turns;
   }
 
-  // Filter sessions by model + date/datetime range
+  // ── Sessions ───────────────────────────────────────────────────────────────
   const filteredSessions = rawData.sessions_all.filter(s => {
     if (!selectedModels.has(s.model)) return false;
     if (!cutoff) return true;
-    if (selectedRange === '1h') return (s.last_full || '') >= cutoff;
-    return s.last_date >= dayCutoff;
+    if (isShort) return (s.last_full || '') >= cutoff;
+    return s.last_date >= cutoff.slice(0, 10);
   });
 
-  // Add session counts into modelMap
   for (const s of filteredSessions) {
     if (modelMap[s.model]) modelMap[s.model].sessions++;
   }
 
   const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // By project: aggregate from filtered sessions
+  // ── By project ────────────────────────────────────────────────────────────
   const projMap = {};
   for (const s of filteredSessions) {
     if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, turns: 0 };
@@ -479,7 +511,7 @@ function applyFilter() {
   }
   const byProject = Object.values(projMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
 
-  // Totals
+  // ── Totals ─────────────────────────────────────────────────────────────────
   const totals = {
     sessions:       filteredSessions.length,
     turns:          byModel.reduce((s, m) => s + m.turns, 0),
@@ -490,11 +522,10 @@ function applyFilter() {
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
 
-  // Update daily chart title
-  document.getElementById('daily-chart-title').textContent = 'Daily Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
+  document.getElementById('daily-chart-title').textContent = 'Token Usage \u2014 ' + RANGE_LABELS[selectedRange];
 
   renderStats(totals);
-  renderDailyChart(daily);
+  renderTimeChart(timeSeries, isShort);
   renderModelChart(byModel);
   renderProjectChart(byProject);
   renderSessionsTable(filteredSessions.slice(0, 20));
@@ -522,18 +553,26 @@ function renderStats(t) {
   `).join('');
 }
 
-function renderDailyChart(daily) {
+function fmtTimeLabel(time, isShort) {
+  if (!isShort) return time;
+  const [datePart, hourPart] = time.split('T');
+  const [, month, day] = datePart.split('-');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${months[parseInt(month)-1]} ${parseInt(day)} ${hourPart}:00`;
+}
+
+function renderTimeChart(timeSeries, isShort) {
   const ctx = document.getElementById('chart-daily').getContext('2d');
   if (charts.daily) charts.daily.destroy();
   charts.daily = new Chart(ctx, {
     type: 'bar',
     data: {
-      labels: daily.map(d => d.day),
+      labels: timeSeries.map(d => fmtTimeLabel(d.time, isShort)),
       datasets: [
-        { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
-        { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
-        { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
-        { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
+        { label: 'Input',          data: timeSeries.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'tokens' },
+        { label: 'Output',         data: timeSeries.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'tokens' },
+        { label: 'Cache Read',     data: timeSeries.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'tokens' },
+        { label: 'Cache Creation', data: timeSeries.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'tokens' },
       ]
     },
     options: {
