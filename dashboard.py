@@ -727,11 +727,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
         elif self.path == "/api/data":
-            try:
-                from scanner import scan
-                scan(verbose=False)
-            except Exception:
-                pass
             data = get_dashboard_data()
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
@@ -750,11 +745,11 @@ def _background_scanner(interval=60):
     import time
     from scanner import scan
     while True:
-        time.sleep(interval)
         try:
             scan(verbose=False)
         except Exception:
             pass
+        time.sleep(interval)
 
 
 def serve(port=8080):
